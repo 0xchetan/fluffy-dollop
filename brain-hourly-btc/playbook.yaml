@@ -1,0 +1,10 @@
+name: brain-hourly-btc
+description: Hourly BTC direction bets on Polymarket binary markets. Uses Gigabrain Brain API for direction calls and Kelly criterion sizing from rolling win rate.
+category: polymarket
+icon: "🎯"
+author: gigabrain
+version: "1.0"
+
+skills:
+  - polymarket
+  - brain
