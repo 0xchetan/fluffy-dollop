@@ -1,0 +1,376 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""Deterministic redeem/reconciliation cycle for Brain Hourly BTC.
+
+Reconciles trade DB with exchange positions, redeems resolved winners,
+marks losers, and detects orphan positions.
+
+Steps:
+  1. Get pending trades from DB
+  2. Get current positions from exchange
+  3. For each pending trade: resolve market, match position, update DB
+  4. Detect orphan positions (exchange positions not in DB)
+
+Zero external dependencies — stdlib only.
+Calls btc_hourly.py and pm_client.py as subprocesses via `uv run`.
+
+Usage:
+    uv run run_redeem.py
+    uv run run_redeem.py --dry-run
+    uv run run_redeem.py --db /data/state/trades.db --max-age-hours 48
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def run_cmd(args_list: list[str], label: str, timeout: int = 120) -> dict:
+    """Run a subprocess, parse JSON stdout, return result dict."""
+    try:
+        result = subprocess.run(
+            args_list,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {"success": False, "error": f"{label}: timed out after {timeout}s"}
+    except FileNotFoundError:
+        return {"success": False, "error": f"{label}: command not found: {args_list[0]}"}
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+
+    if result.returncode != 0:
+        if stdout:
+            try:
+                return json.loads(stdout)
+            except json.JSONDecodeError:
+                pass
+        return {
+            "success": False,
+            "error": f"{label}: exit code {result.returncode}",
+            "stderr": stderr or None,
+            "stdout": stdout or None,
+        }
+
+    if not stdout:
+        return {"success": False, "error": f"{label}: no output"}
+
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        # history command returns a bare list
+        try:
+            parsed = json.loads(stdout)
+            if isinstance(parsed, list):
+                return {"success": True, "trades": parsed}
+        except json.JSONDecodeError:
+            pass
+        return {"success": False, "error": f"{label}: invalid JSON", "raw": stdout[:500]}
+
+
+def resolve_paths(args) -> tuple[str, str]:
+    """Resolve btc_hourly.py and pm_client.py paths."""
+    script_dir = Path(__file__).resolve().parent
+    btc_hourly = str(script_dir / "btc_hourly.py")
+
+    if args.pm_client:
+        pm_client = args.pm_client
+    else:
+        skill_dir = os.environ.get("SKILL_DIR", "")
+        if skill_dir:
+            pm_client = os.path.join(skill_dir, "scripts", "pm_client.py")
+        else:
+            pm_client = str(script_dir.parent.parent.parent / "skills" / "polymarket" / "scripts" / "pm_client.py")
+
+    return btc_hourly, pm_client
+
+
+def parse_timestamp(ts: str | None) -> datetime | None:
+    """Parse an ISO timestamp string, return None on failure."""
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main logic
+# ---------------------------------------------------------------------------
+
+def run_redeem(args) -> dict:
+    """Execute the full redeem/reconciliation cycle."""
+    btc_hourly, pm_client = resolve_paths(args)
+    db = args.db
+    now = datetime.now(timezone.utc)
+
+    output: dict = {
+        "timestamp": now.isoformat(),
+        "dry_run": args.dry_run,
+        "pending_total": 0,
+        "pending_active": 0,
+        "resolved_count": 0,
+        "resolutions": [],
+        "orphans": [],
+        "errors": [],
+    }
+
+    # Step 1: Get pending trades from DB
+    history_result = run_cmd(
+        ["uv", "run", btc_hourly, "history", "--db", db, "--limit", "200"],
+        "history",
+    )
+
+    # Parse trades — history returns a list or {"trades": [...]}
+    all_trades: list[dict] = []
+    if isinstance(history_result, list):
+        all_trades = history_result
+    elif isinstance(history_result, dict):
+        if isinstance(history_result.get("trades"), list):
+            all_trades = history_result["trades"]
+        elif history_result.get("success") is False:
+            output["errors"].append({"step": "get_history", "error": history_result.get("error", "Failed to get history")})
+            return output
+
+    pending_trades = []
+    for trade in all_trades:
+        if trade.get("status") != "pending":
+            continue
+        ts = parse_timestamp(trade.get("timestamp"))
+        if ts:
+            age_hours = (now - ts).total_seconds() / 3600
+            if age_hours > args.max_age_hours:
+                continue  # Too old, skip
+        pending_trades.append(trade)
+
+    output["pending_total"] = len(pending_trades)
+
+    if not pending_trades:
+        return output
+
+    # Step 2: Get current positions from exchange
+    positions_result = run_cmd(
+        ["uv", "run", pm_client, "positions"],
+        "positions",
+    )
+
+    positions: list[dict] = []
+    if positions_result.get("success"):
+        positions = positions_result.get("positions", [])
+
+    # Build condition_id → position lookup
+    position_by_condition: dict[str, dict] = {}
+    for pos in positions:
+        cid = pos.get("condition_id", "")
+        if cid:
+            position_by_condition[cid] = pos
+
+    # Track which condition_ids we matched from DB
+    matched_condition_ids: set[str] = set()
+
+    # Step 3: For each pending trade, resolve and reconcile
+    output["pending_active"] = len(pending_trades)
+
+    for trade in pending_trades:
+        trade_id = trade.get("id")
+        market_slug = trade.get("market_slug", "")
+
+        if not market_slug:
+            output["errors"].append({
+                "trade_id": trade_id,
+                "error": "No market_slug in trade record",
+            })
+            continue
+
+        # Resolve market to get condition_id and end_date
+        resolve_result = run_cmd(
+            ["uv", "run", pm_client, "resolve", "--market-slug", market_slug],
+            f"resolve-{market_slug}",
+        )
+
+        if not resolve_result.get("success") or not resolve_result.get("resolved"):
+            output["errors"].append({
+                "trade_id": trade_id,
+                "market_slug": market_slug,
+                "error": resolve_result.get("error", "Could not resolve market"),
+            })
+            continue
+
+        market_info = resolve_result.get("market", {})
+        condition_id = market_info.get("condition_id", "")
+        end_date_str = market_info.get("end_date", "")
+        end_date = parse_timestamp(end_date_str)
+
+        if not condition_id:
+            output["errors"].append({
+                "trade_id": trade_id,
+                "market_slug": market_slug,
+                "error": "No condition_id in resolved market",
+            })
+            continue
+
+        matched_condition_ids.add(condition_id)
+
+        # Find matching position
+        position = position_by_condition.get(condition_id)
+
+        if position:
+            current_price = position.get("current_price", 0.5)
+            resolved = position.get("resolved", False)
+            redeemable = position.get("redeemable", False)
+
+            if not resolved and not redeemable:
+                # Still active, skip
+                continue
+
+            buy_price = trade.get("price", 0.50)
+            shares = position.get("size", trade.get("shares", 0))
+
+            if current_price >= 0.99:
+                # Won
+                pnl = round(shares * (1.0 - buy_price), 2)
+                won = True
+            elif current_price <= 0.01:
+                # Lost
+                pnl = round(-(shares * buy_price), 2)
+                won = False
+            else:
+                # Ambiguous — skip for now
+                continue
+
+            resolution: dict = {
+                "trade_id": trade_id,
+                "market_slug": market_slug,
+                "condition_id": condition_id,
+                "result": "won" if won else "lost",
+                "pnl": pnl,
+                "shares": shares,
+                "current_price": current_price,
+            }
+
+            # Redeem if won
+            if won and redeemable:
+                if args.dry_run:
+                    resolution["redeem"] = {"dry_run": True}
+                else:
+                    redeem_result = run_cmd(
+                        ["uv", "run", pm_client, "redeem", "--condition-id", condition_id],
+                        f"redeem-{condition_id}",
+                    )
+                    resolution["redeem"] = {
+                        "success": redeem_result.get("success", False),
+                        "error": redeem_result.get("error") if not redeem_result.get("success") else None,
+                    }
+
+            # Update DB
+            if args.dry_run:
+                resolution["db_update"] = {"dry_run": True}
+            else:
+                won_flag = "--won" if won else "--lost"
+                update_result = run_cmd(
+                    ["uv", "run", btc_hourly, "update",
+                     "--db", db,
+                     "--trade-id", str(trade_id),
+                     won_flag,
+                     "--pnl", str(pnl)],
+                    f"update-{trade_id}",
+                )
+                resolution["db_update"] = {"success": update_result.get("success", True)}
+
+            output["resolutions"].append(resolution)
+            output["resolved_count"] += 1
+
+        else:
+            # No position found — check if market has ended
+            if end_date and (now - end_date).total_seconds() > 7200:
+                # Market ended >2hrs ago with no position — likely unfilled or redeemed to 0
+                buy_price = trade.get("price", 0.50)
+                shares = trade.get("shares", 0)
+                pnl = round(-(shares * buy_price), 2)
+
+                resolution = {
+                    "trade_id": trade_id,
+                    "market_slug": market_slug,
+                    "condition_id": condition_id,
+                    "result": "lost",
+                    "pnl": pnl,
+                    "reason": "No position found, market ended >2hrs ago",
+                }
+
+                if args.dry_run:
+                    resolution["db_update"] = {"dry_run": True}
+                else:
+                    update_result = run_cmd(
+                        ["uv", "run", btc_hourly, "update",
+                         "--db", db,
+                         "--trade-id", str(trade_id),
+                         "--lost",
+                         "--pnl", str(pnl),
+                         "--notes", "No position found after market end"],
+                        f"update-{trade_id}",
+                    )
+                    resolution["db_update"] = {"success": update_result.get("success", True)}
+
+                output["resolutions"].append(resolution)
+                output["resolved_count"] += 1
+
+    # Step 4: Orphan detection
+    for pos in positions:
+        title = (pos.get("title") or "").lower()
+        cid = pos.get("condition_id", "")
+        if "bitcoin" in title and cid and cid not in matched_condition_ids:
+            output["orphans"].append({
+                "condition_id": cid,
+                "title": pos.get("title"),
+                "outcome": pos.get("outcome"),
+                "size": pos.get("size"),
+                "current_price": pos.get("current_price"),
+            })
+
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Brain Hourly BTC — redeem/reconciliation cycle")
+    parser.add_argument("--db", default="/data/state/trades.db", help="Path to trade database")
+    parser.add_argument("--pm-client", default="", help="Path to pm_client.py (default: $SKILL_DIR/scripts/pm_client.py)")
+    parser.add_argument("--max-age-hours", type=float, default=48, help="Max age of pending trades to process")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen without redeeming or updating")
+    args = parser.parse_args()
+
+    try:
+        result = run_redeem(args)
+    except Exception as e:
+        result = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "dry_run": args.dry_run,
+            "pending_total": 0,
+            "pending_active": 0,
+            "resolved_count": 0,
+            "resolutions": [],
+            "orphans": [],
+            "errors": [{"step": "main", "error": str(e)}],
+        }
+
+    print(json.dumps(result, indent=2))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
