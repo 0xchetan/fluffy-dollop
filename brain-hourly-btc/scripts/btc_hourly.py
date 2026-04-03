@@ -67,12 +67,21 @@ def next_hour_et() -> datetime:
     return (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
 
 
-def construct_event_slug(target_et: datetime) -> str:
-    """Construct event slug: bitcoin-up-or-down-april-3-8am-et"""
+def construct_event_slug(target_et: datetime, with_year: bool = False) -> str:
+    """Construct event slug for Polymarket hourly BTC markets.
+
+    Polymarket has used two formats:
+      - bitcoin-up-or-down-april-3-8am-et          (no year)
+      - bitcoin-up-or-down-april-3-2026-8am-et     (with year)
+    The format flips periodically. Callers should try both.
+    """
     month = target_et.strftime("%B").lower()
     day = target_et.day
     hour_12 = target_et.strftime("%I").lstrip("0")
     ampm = target_et.strftime("%p").lower()
+    if with_year:
+        year = target_et.year
+        return f"bitcoin-up-or-down-{month}-{day}-{year}-{hour_12}{ampm}-et"
     return f"bitcoin-up-or-down-{month}-{day}-{hour_12}{ampm}-et"
 
 
@@ -192,7 +201,8 @@ async def cmd_predict(args):
     prediction = await ask_brain(btc_price)
 
     target_et = next_hour_et()
-    event_slug = construct_event_slug(target_et)
+    event_slug = construct_event_slug(target_et, with_year=False)
+    event_slug_alt = construct_event_slug(target_et, with_year=True)
 
     now_utc = datetime.now(timezone.utc)
     mins_until = (target_et.astimezone(timezone.utc) - now_utc).total_seconds() / 60
@@ -203,6 +213,7 @@ async def cmd_predict(args):
         "confidence": prediction.confidence,
         "reasoning": prediction.reasoning,
         "event_slug": event_slug,
+        "event_slug_alt": event_slug_alt,
         "target_time_et": target_et.strftime("%Y-%m-%d %I:%M %p ET"),
         "minutes_until": round(mins_until, 1),
     }, indent=2))
