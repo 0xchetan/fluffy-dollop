@@ -234,23 +234,38 @@ def step_predict(btc_hourly: str) -> tuple[bool, dict, dict]:
     })
 
 
-def step_find_market(pm_client: str, event_slug: str) -> tuple[bool, dict, dict]:
-    """Find the market closest to 0.50 for the event."""
-    result = run_cmd(
-        ["uv", "run", pm_client, "events", "--slug", event_slug],
-        "events",
-    )
+def step_find_market(pm_client: str, event_slug: str, event_slug_alt: str = "") -> tuple[bool, dict, dict]:
+    """Find the market closest to 0.50 for the event.
 
-    if not result.get("success"):
-        return False, {}, step_result("find_market", False, error=result.get("error", f"Event lookup failed for {event_slug}"))
+    Tries event_slug first, falls back to event_slug_alt if no events found.
+    Polymarket flips between with-year and without-year slug formats.
+    """
+    slugs_to_try = [event_slug]
+    if event_slug_alt:
+        slugs_to_try.append(event_slug_alt)
 
-    events = result.get("events", [])
+    events: list[dict] = []
+    used_slug = event_slug
+    last_error = ""
+
+    for slug in slugs_to_try:
+        result = run_cmd(
+            ["uv", "run", pm_client, "events", "--slug", slug],
+            "events",
+        )
+        if result.get("success") and result.get("events"):
+            events = result["events"]
+            used_slug = slug
+            break
+        last_error = result.get("error", f"No events for {slug}")
+
     if not events:
-        return False, {}, step_result("find_market", False, error=f"No events found for slug: {event_slug}")
+        tried = " and ".join(slugs_to_try)
+        return False, {}, step_result("find_market", False, error=f"No events found for {tried}: {last_error}")
 
     markets = events[0].get("markets", [])
     if not markets:
-        return False, {}, step_result("find_market", False, error=f"No markets in event: {event_slug}")
+        return False, {}, step_result("find_market", False, error=f"No markets in event: {used_slug}")
 
     # Find market with Up price closest to 0.50
     best_market = None
@@ -482,9 +497,10 @@ def run_hourly(args) -> dict:
     confidence = predict_data.get("confidence", 0)
     reasoning = predict_data.get("reasoning", "")
     event_slug = predict_data["event_slug"]
+    event_slug_alt = predict_data.get("event_slug_alt", "")
 
-    # Step 5: Find market
-    can_continue, market_data, sr = step_find_market(pm_client, event_slug)
+    # Step 5: Find market (tries both slug formats — Polymarket flips between them)
+    can_continue, market_data, sr = step_find_market(pm_client, event_slug, event_slug_alt)
     steps.append(sr)
     if not can_continue:
         output["action"] = "skipped"
