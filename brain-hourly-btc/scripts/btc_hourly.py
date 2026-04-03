@@ -68,13 +68,12 @@ def next_hour_et() -> datetime:
 
 
 def construct_event_slug(target_et: datetime) -> str:
-    """Construct event slug: bitcoin-above-on-april-3-2026-5am-et"""
+    """Construct event slug: bitcoin-up-or-down-april-3-8am-et"""
     month = target_et.strftime("%B").lower()
     day = target_et.day
-    year = target_et.year
     hour_12 = target_et.strftime("%I").lstrip("0")
     ampm = target_et.strftime("%p").lower()
-    return f"bitcoin-above-on-{month}-{day}-{year}-{hour_12}{ampm}-et"
+    return f"bitcoin-up-or-down-{month}-{day}-{hour_12}{ampm}-et"
 
 
 # ---------------------------------------------------------------------------
