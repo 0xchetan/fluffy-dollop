@@ -53,10 +53,9 @@ uv run $SUPERAGENT_PLAYBOOK/scripts/btc_hourly.py predict
 ## Step 5: Set Up Schedules
 
 ```python
-schedule_recurring("hourly btc cycle", "57 * * * *")           # minute 57, every hour
-schedule_recurring("redeem resolved positions", "30 */2 * * *") # minute 30, every 2 hours
-schedule_recurring("redeem stragglers", "30 */4 * * *")         # minute 30, every 4 hours
-schedule_recurring("daily btc summary", "0 0 * * *")            # midnight UTC
+schedule_recurring("hourly btc cycle: uv run $SUPERAGENT_PLAYBOOK/scripts/run_hourly.py --db /data/state/trades.db --max-bet <MAX_BET>", "57 * * * *")
+schedule_recurring("redeem cycle: uv run $SUPERAGENT_PLAYBOOK/scripts/run_redeem.py --db /data/state/trades.db", "0 */2 * * *")
+schedule_recurring("daily btc performance summary", "0 0 * * *")
 ```
 
 ## Step 6: Go Live
