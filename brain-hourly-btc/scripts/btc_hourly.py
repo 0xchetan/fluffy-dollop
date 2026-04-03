@@ -97,6 +97,59 @@ async def fetch_btc_price() -> float:
         return float(resp.json()["price"])
 
 
+_STREAM_REQUIRED_PROVIDERS = {"litellm"}
+
+
+async def _brain_query_stream(api_url: str, headers: dict, payload: dict) -> str:
+    """SSE streaming query — required for litellm and similar providers."""
+    payload["stream"] = True
+    content_parts: list[str] = []
+
+    async with httpx.AsyncClient(timeout=600, headers=headers) as client:
+        async with client.stream(
+            "POST", f"{api_url}/v1/chat", json=payload,
+        ) as resp:
+            resp.raise_for_status()
+            event_lines: list[str] = []
+            async for line in resp.aiter_lines():
+                if line:
+                    event_lines.append(line)
+                    continue
+                for event_line in event_lines:
+                    if not event_line.startswith("data: "):
+                        continue
+                    try:
+                        evt = json.loads(event_line[6:])
+                    except json.JSONDecodeError:
+                        continue
+                    if evt.get("event") == "RunResponseContent":
+                        content_parts.append(evt.get("content", ""))
+                    elif evt.get("event") == "error":
+                        raise RuntimeError(evt.get("message", "Stream error"))
+                event_lines = []
+
+    return "".join(content_parts)
+
+
+async def _brain_query_plain(api_url: str, headers: dict, payload: dict) -> str:
+    """Non-streaming query — plain JSON response."""
+    async with httpx.AsyncClient(timeout=120, headers=headers) as client:
+        resp = await client.post(f"{api_url}/v1/chat", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+    return data.get("content") or data.get("message") or ""
+
+
+def _extract_json(text: str) -> dict:
+    """Extract JSON from Brain response (may be wrapped in markdown code block)."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    return json.loads(text)
+
+
 async def ask_brain(btc_price: float) -> BrainPrediction:
     """Ask Gigabrain Brain for a BTC direction call."""
     api_url = os.environ.get("GIGABRAIN_API_URL", "")
@@ -122,30 +175,24 @@ async def ask_brain(btc_price: float) -> BrainPrediction:
     payload: dict = {"message": prompt}
 
     model = os.environ.get("GIGABRAIN_MODEL")
-    model_provider = os.environ.get("GIGABRAIN_MODEL_PROVIDER")
+    model_provider = os.environ.get("GIGABRAIN_MODEL_PROVIDER", "")
     if model:
         payload["model"] = model
     if model_provider:
         payload["model_provider"] = model_provider
 
-    async with httpx.AsyncClient(timeout=120, headers=headers) as client:
-        resp = await client.post(
-            f"{api_url.rstrip('/')}/v1/chat",
-            json=payload,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    api_url = api_url.rstrip("/")
+    use_stream = model_provider in _STREAM_REQUIRED_PROVIDERS
 
-    content = data.get("content") or data.get("message") or ""
+    if use_stream:
+        content = await _brain_query_stream(api_url, headers, payload)
+    else:
+        content = await _brain_query_plain(api_url, headers, payload)
 
-    # Parse JSON from Brain response (may be wrapped in markdown code block)
-    text = content.strip()
-    if text.startswith("```"):
-        lines = text.split("\n")
-        lines = [l for l in lines if not l.strip().startswith("```")]
-        text = "\n".join(lines).strip()
+    if not content:
+        raise RuntimeError("Empty response from Brain API")
 
-    parsed = json.loads(text)
+    parsed = _extract_json(content)
     return BrainPrediction(
         direction=parsed["direction"].lower(),
         confidence=float(parsed["confidence"]),
