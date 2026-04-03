@@ -97,11 +97,8 @@ async def fetch_btc_price() -> float:
         return float(resp.json()["price"])
 
 
-_STREAM_REQUIRED_PROVIDERS = {"litellm"}
-
-
-async def _brain_query_stream(api_url: str, headers: dict, payload: dict) -> str:
-    """SSE streaming query — required for litellm and similar providers."""
+async def _brain_query(api_url: str, headers: dict, payload: dict) -> str:
+    """Query Brain API via SSE streaming. Always uses stream=true."""
     payload["stream"] = True
     content_parts: list[str] = []
 
@@ -129,15 +126,6 @@ async def _brain_query_stream(api_url: str, headers: dict, payload: dict) -> str
                 event_lines = []
 
     return "".join(content_parts)
-
-
-async def _brain_query_plain(api_url: str, headers: dict, payload: dict) -> str:
-    """Non-streaming query — plain JSON response."""
-    async with httpx.AsyncClient(timeout=120, headers=headers) as client:
-        resp = await client.post(f"{api_url}/v1/chat", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-    return data.get("content") or data.get("message") or ""
 
 
 def _extract_json(text: str) -> dict:
@@ -181,13 +169,7 @@ async def ask_brain(btc_price: float) -> BrainPrediction:
     if model_provider:
         payload["model_provider"] = model_provider
 
-    api_url = api_url.rstrip("/")
-    use_stream = model_provider in _STREAM_REQUIRED_PROVIDERS
-
-    if use_stream:
-        content = await _brain_query_stream(api_url, headers, payload)
-    else:
-        content = await _brain_query_plain(api_url, headers, payload)
+    content = await _brain_query(api_url.rstrip("/"), headers, payload)
 
     if not content:
         raise RuntimeError("Empty response from Brain API")
