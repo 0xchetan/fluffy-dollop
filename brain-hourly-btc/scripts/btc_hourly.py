@@ -335,7 +335,7 @@ def main():
     p.add_argument("--confidence", type=float, required=True)
     p.add_argument("--reasoning", default="")
     p.add_argument("--market-slug", required=True)
-    p.add_argument("--outcome", required=True, choices=["Yes", "No"])
+    p.add_argument("--outcome", required=True, choices=["Up", "Down"])
     p.add_argument("--shares", type=float, default=0)
     p.add_argument("--price", type=float, default=0.50)
     p.add_argument("--order-id", default="")
