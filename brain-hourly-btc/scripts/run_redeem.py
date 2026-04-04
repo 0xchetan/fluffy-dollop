@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -108,6 +109,25 @@ def parse_timestamp(ts: str | None) -> datetime | None:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+
+
+def alt_slug(slug: str) -> str:
+    """Flip a slug between with-year and without-year format.
+
+    Polymarket hourly BTC events alternate between:
+      bitcoin-up-or-down-april-3-8am-et          (no year)
+      bitcoin-up-or-down-april-3-2026-8am-et     (with year)
+    """
+    # With year → without: strip the 4-digit year segment
+    m = re.match(r"^(bitcoin-up-or-down-\w+-\d+)-(\d{4})-(\d+\w+-et)$", slug)
+    if m:
+        return f"{m.group(1)}-{m.group(3)}"
+    # Without year → with: insert current year
+    m = re.match(r"^(bitcoin-up-or-down-\w+-\d+)-(\d+\w+-et)$", slug)
+    if m:
+        year = datetime.now(timezone.utc).year
+        return f"{m.group(1)}-{year}-{m.group(2)}"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -198,11 +218,20 @@ def run_redeem(args) -> dict:
             })
             continue
 
-        # Resolve market to get condition_id and end_date
+        # Resolve market to get condition_id and end_date.
+        # Try stored slug first, fall back to alt format (year ↔ no-year).
         resolve_result = run_cmd(
             ["uv", "run", pm_client, "resolve", "--market-slug", market_slug],
             f"resolve-{market_slug}",
         )
+
+        if not resolve_result.get("success") or not resolve_result.get("resolved"):
+            fallback = alt_slug(market_slug)
+            if fallback:
+                resolve_result = run_cmd(
+                    ["uv", "run", pm_client, "resolve", "--market-slug", fallback],
+                    f"resolve-{fallback}",
+                )
 
         if not resolve_result.get("success") or not resolve_result.get("resolved"):
             output["errors"].append({
@@ -235,24 +264,24 @@ def run_redeem(args) -> dict:
             resolved = position.get("resolved", False)
             redeemable = position.get("redeemable", False)
 
-            if not resolved and not redeemable:
-                # Still active, skip
+            # Determine outcome from current_price — don't require
+            # resolved/redeemable flags since Polymarket can lag on these.
+            # Price at 0.99+ or 0.01- means the market has effectively settled.
+            if current_price >= 0.99:
+                won = True
+            elif current_price <= 0.01:
+                won = False
+            else:
+                # Still mid-range, genuinely unresolved
                 continue
 
             buy_price = trade.get("price", 0.50)
             shares = position.get("size", trade.get("shares", 0))
 
-            if current_price >= 0.99:
-                # Won
+            if won:
                 pnl = round(shares * (1.0 - buy_price), 2)
-                won = True
-            elif current_price <= 0.01:
-                # Lost
-                pnl = round(-(shares * buy_price), 2)
-                won = False
             else:
-                # Ambiguous — skip for now
-                continue
+                pnl = round(-(shares * buy_price), 2)
 
             resolution: dict = {
                 "trade_id": trade_id,
@@ -262,9 +291,10 @@ def run_redeem(args) -> dict:
                 "pnl": pnl,
                 "shares": shares,
                 "current_price": current_price,
+                "redeemable": redeemable,
             }
 
-            # Redeem if won
+            # Attempt on-chain redeem only if Polymarket says it's redeemable
             if won and redeemable:
                 if args.dry_run:
                     resolution["redeem"] = {"dry_run": True}
@@ -277,8 +307,10 @@ def run_redeem(args) -> dict:
                         "success": redeem_result.get("success", False),
                         "error": redeem_result.get("error") if not redeem_result.get("success") else None,
                     }
+            elif won and not redeemable:
+                resolution["redeem"] = {"pending": True, "reason": "settled but not yet redeemable on-chain"}
 
-            # Update DB
+            # Update DB regardless — accounting shouldn't wait for on-chain redemption
             if args.dry_run:
                 resolution["db_update"] = {"dry_run": True}
             else:
