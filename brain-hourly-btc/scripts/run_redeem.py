@@ -238,10 +238,7 @@ def run_redeem(args) -> dict:
 
     output["pending_total"] = len(pending_trades)
 
-    if not pending_trades:
-        return output
-
-    # Step 2: Get current positions from exchange
+    # Step 2: Get current positions from exchange (always, even if no pending trades — sweep needs them)
     positions_result = run_cmd(
         ["uv", "run", pm_client, "positions"],
         "positions",
@@ -345,9 +342,8 @@ def run_redeem(args) -> dict:
                 "redeemable": redeemable,
             }
 
-            # Attempt on-chain redeem for winners — don't trust the
-            # redeemable flag, just try it and let the contract decide.
-            # Polymarket lags on flipping redeemable for hourly markets.
+            # Attempt on-chain redeem for winners.
+            redeemed = False
             if won and condition_id:
                 if args.dry_run:
                     resolution["redeem"] = {"dry_run": True, "redeemable_flag": redeemable}
@@ -356,27 +352,34 @@ def run_redeem(args) -> dict:
                         ["uv", "run", pm_client, "redeem", "--condition-id", condition_id],
                         f"redeem-{condition_id}",
                     )
+                    redeemed = redeem_result.get("success", False)
                     resolution["redeem"] = {
-                        "success": redeem_result.get("success", False),
+                        "success": redeemed,
                         "attempted": True,
                         "redeemable_flag": redeemable,
-                        "error": redeem_result.get("error") if not redeem_result.get("success") else None,
+                        "error": redeem_result.get("error") if not redeemed else None,
                     }
 
-            # Update DB regardless — accounting shouldn't wait for on-chain redemption
+            # Update DB: settled_won/settled_lost if redeem didn't succeed,
+            # won/lost if it did (or for losses where no redeem is needed).
             if args.dry_run:
                 resolution["db_update"] = {"dry_run": True}
             else:
                 won_flag = "--won" if won else "--lost"
-                update_result = run_cmd(
-                    ["uv", "run", btc_hourly, "update",
-                     "--db", db,
-                     "--trade-id", str(trade_id),
-                     won_flag,
-                     "--pnl", str(pnl)],
-                    f"update-{trade_id}",
-                )
-                resolution["db_update"] = {"success": update_result.get("success", True)}
+                # Winners that haven't been redeemed → settled; losses → final
+                use_settled = won and not redeemed
+                cmd = ["uv", "run", btc_hourly, "update",
+                       "--db", db,
+                       "--trade-id", str(trade_id),
+                       won_flag,
+                       "--pnl", str(pnl)]
+                if use_settled:
+                    cmd.append("--settled")
+                update_result = run_cmd(cmd, f"update-{trade_id}")
+                resolution["db_update"] = {
+                    "success": update_result.get("success", True),
+                    "status": update_result.get("status", "settled_won" if use_settled else ("won" if won else "lost")),
+                }
 
             output["resolutions"].append(resolution)
             output["resolved_count"] += 1
@@ -423,8 +426,9 @@ def run_redeem(args) -> dict:
             })
 
     # Step 4: Sweep — try to redeem ALL winning positions regardless of DB.
-    # This catches positions where the DB was already updated (won) but
-    # the on-chain redeem failed or was never attempted.
+    # This catches positions where the DB was already updated (settled_won)
+    # but the on-chain redeem failed or was never attempted.
+    # On successful redeem, promotes matching DB trades from settled_won → won.
     output["sweep"] = []
     for pos in positions:
         cid = pos.get("condition_id", "")
@@ -450,10 +454,30 @@ def run_redeem(args) -> dict:
                     ["uv", "run", pm_client, "redeem", "--condition-id", cid],
                     f"sweep-redeem-{cid[:12]}",
                 )
+                redeemed = redeem_result.get("success", False)
                 sweep_entry["redeem"] = {
-                    "success": redeem_result.get("success", False),
-                    "error": redeem_result.get("error") if not redeem_result.get("success") else None,
+                    "success": redeemed,
+                    "error": redeem_result.get("error") if not redeemed else None,
                 }
+
+                # If redeemed, promote any settled_won DB trades to won
+                if redeemed:
+                    # Find matching trade by condition_id in our matched set
+                    for trade in all_trades:
+                        if trade.get("status") == "settled_won":
+                            # Match by position title against trade slug
+                            matched_pos = match_trade_to_position(trade, [pos])
+                            if matched_pos:
+                                run_cmd(
+                                    ["uv", "run", btc_hourly, "update",
+                                     "--db", db,
+                                     "--trade-id", str(trade["id"]),
+                                     "--won",
+                                     "--pnl", str(trade.get("pnl", 0))],
+                                    f"promote-{trade['id']}",
+                                )
+                                sweep_entry["promoted_trade_id"] = trade["id"]
+                                break
 
             output["sweep"].append(sweep_entry)
 

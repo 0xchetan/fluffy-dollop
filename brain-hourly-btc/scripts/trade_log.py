@@ -99,10 +99,21 @@ def resolve_trade(
     won: bool,
     pnl: float,
     notes: str | None = None,
+    settled: bool = False,
 ) -> None:
-    """Resolve a pending trade as won or lost."""
+    """Resolve a trade.
+
+    Status lifecycle: pending → settled_won/settled_lost → won/lost
+
+    Args:
+        settled: If True, mark as settled_won/settled_lost (outcome known,
+                 cash not yet collected). If False, mark as won/lost (final).
+    """
     now = datetime.now(timezone.utc).isoformat()
-    status = "won" if won else "lost"
+    if settled:
+        status = "settled_won" if won else "settled_lost"
+    else:
+        status = "won" if won else "lost"
     conn.execute(
         """UPDATE trades SET status = ?, resolved_at = ?, pnl = ?, notes = ?
         WHERE id = ?""",
@@ -122,30 +133,44 @@ def get_pending_trades(conn: sqlite3.Connection) -> list[dict]:
 def get_rolling_results(
     conn: sqlite3.Connection, window: int = 50
 ) -> list[bool]:
-    """Get the most recent `window` resolved results as booleans."""
+    """Get the most recent `window` resolved results as booleans.
+
+    Includes both final (won/lost) and settled (settled_won/settled_lost)
+    statuses — the outcome is known either way.
+    """
     rows = conn.execute(
         """SELECT status FROM trades
-        WHERE status IN ('won', 'lost')
+        WHERE status IN ('won', 'lost', 'settled_won', 'settled_lost')
         ORDER BY id DESC LIMIT ?""",
         (window,),
     ).fetchall()
     # Reverse to oldest-first order
-    return [r["status"] == "won" for r in reversed(rows)]
+    return [r["status"] in ("won", "settled_won") for r in reversed(rows)]
 
 
 def get_stats(conn: sqlite3.Connection, window: int = 50) -> dict:
-    """Get rolling statistics."""
+    """Get rolling statistics.
+
+    Status lifecycle: pending → settled_won/settled_lost → won/lost
+    Both settled and final statuses count toward win rate and P&L.
+    """
     total = conn.execute("SELECT COUNT(*) as n FROM trades").fetchone()["n"]
     resolved = conn.execute(
-        "SELECT COUNT(*) as n FROM trades WHERE status IN ('won', 'lost')"
+        "SELECT COUNT(*) as n FROM trades WHERE status IN ('won', 'lost', 'settled_won', 'settled_lost')"
     ).fetchone()["n"]
     pending = conn.execute(
         "SELECT COUNT(*) as n FROM trades WHERE status = 'pending'"
+    ).fetchone()["n"]
+    settled = conn.execute(
+        "SELECT COUNT(*) as n FROM trades WHERE status IN ('settled_won', 'settled_lost')"
     ).fetchone()["n"]
     skipped = conn.execute(
         "SELECT COUNT(*) as n FROM trades WHERE status = 'skipped'"
     ).fetchone()["n"]
     wins = conn.execute(
+        "SELECT COUNT(*) as n FROM trades WHERE status IN ('won', 'settled_won')"
+    ).fetchone()["n"]
+    redeemed = conn.execute(
         "SELECT COUNT(*) as n FROM trades WHERE status = 'won'"
     ).fetchone()["n"]
     total_pnl = conn.execute(
@@ -164,16 +189,17 @@ def get_stats(conn: sqlite3.Connection, window: int = 50) -> dict:
     # Current streak
     recent = conn.execute(
         """SELECT status FROM trades
-        WHERE status IN ('won', 'lost')
+        WHERE status IN ('won', 'lost', 'settled_won', 'settled_lost')
         ORDER BY id DESC LIMIT 50"""
     ).fetchall()
     streak = 0
     streak_type = None
     for r in recent:
+        normalized = "won" if r["status"] in ("won", "settled_won") else "lost"
         if streak_type is None:
-            streak_type = r["status"]
+            streak_type = normalized
             streak = 1
-        elif r["status"] == streak_type:
+        elif normalized == streak_type:
             streak += 1
         else:
             break
@@ -182,6 +208,8 @@ def get_stats(conn: sqlite3.Connection, window: int = 50) -> dict:
         "total_trades": total,
         "resolved": resolved,
         "pending": pending,
+        "settled_awaiting_redeem": settled,
+        "redeemed": redeemed,
         "skipped": skipped,
         "wins": wins,
         "losses": resolved - wins,

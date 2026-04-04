@@ -303,11 +303,19 @@ async def cmd_record(args):
 
 
 async def cmd_update(args):
-    """Update a trade's status (won/lost) during redeem cycle."""
+    """Update a trade's status during redeem cycle.
+
+    --settled: mark as settled_won/settled_lost (outcome known, not yet redeemed)
+    without --settled: mark as won/lost (final, cash collected)
+    """
     conn = init_db(args.db)
-    resolve_trade(conn, args.trade_id, args.won, args.pnl, notes=args.notes)
+    resolve_trade(conn, args.trade_id, args.won, args.pnl, notes=args.notes, settled=args.settled)
     conn.close()
-    print(json.dumps({"trade_id": args.trade_id, "status": "won" if args.won else "lost", "pnl": args.pnl}))
+    if args.settled:
+        status = "settled_won" if args.won else "settled_lost"
+    else:
+        status = "won" if args.won else "lost"
+    print(json.dumps({"trade_id": args.trade_id, "status": status, "pnl": args.pnl}))
 
 
 async def cmd_status(args):
@@ -351,11 +359,12 @@ def main():
     p.add_argument("--price", type=float, default=0.50)
     p.add_argument("--order-id", default="")
 
-    p = sub.add_parser("update", help="Mark a trade won/lost (during redeem cycle)")
+    p = sub.add_parser("update", help="Mark a trade won/lost or settled (during redeem cycle)")
     p.add_argument("--db", default="trades.db", help="Path to trade database")
     p.add_argument("--trade-id", type=int, required=True)
     p.add_argument("--won", action="store_true")
     p.add_argument("--lost", action="store_true")
+    p.add_argument("--settled", action="store_true", help="Mark as settled (outcome known, not yet redeemed)")
     p.add_argument("--pnl", type=float, required=True)
     p.add_argument("--notes", default="")
 
