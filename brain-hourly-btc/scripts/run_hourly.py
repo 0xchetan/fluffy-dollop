@@ -27,6 +27,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -324,7 +325,9 @@ def step_duplicate_check(btc_hourly: str, db: str, market_slug: str) -> tuple[bo
         trades = result
 
     for trade in trades:
-        if trade.get("market_slug") == market_slug and trade.get("status") in ("pending", "won", "lost"):
+        if trade.get("market_slug") == market_slug and trade.get("status") in (
+            "pending", "won", "lost", "settled_won", "settled_lost",
+        ):
             return False, {}, step_result(
                 "duplicate_check", False,
                 error=f"Already traded market {market_slug} (trade #{trade.get('id')}, status={trade.get('status')})",
@@ -445,6 +448,29 @@ def step_record(
     return True, result, step_result("record", False, error=result.get("error", "Record failed"))
 
 
+def step_exchange_duplicate_check(pm_client: str, market_slug: str) -> tuple[bool, dict, dict]:
+    """Check if there are already open orders for this market on the exchange."""
+    result = run_cmd(
+        ["uv", "run", pm_client, "my-orders", "--raw"],
+        "my-orders-dup-check",
+    )
+
+    if not result.get("success") or not result.get("orders"):
+        # Can't check or no open orders — proceed
+        return True, {}, step_result("exchange_dup_check", True, {"open_orders": 0})
+
+    for order in result["orders"]:
+        order_market = order.get("market_slug") or order.get("market", "")
+        if order_market == market_slug:
+            order_id = order.get("id") or order.get("order_id", "")
+            return False, {}, step_result(
+                "exchange_dup_check", False,
+                error=f"Open order already exists for {market_slug} (order_id={order_id})",
+            )
+
+    return True, {}, step_result("exchange_dup_check", True, {"open_orders": len(result["orders"])})
+
+
 # ---------------------------------------------------------------------------
 # Main orchestrator
 # ---------------------------------------------------------------------------
@@ -518,12 +544,20 @@ def run_hourly(args) -> dict:
         outcome = "Down"
         buy_price = round(1.0 - up_price, 4)
 
-    # Step 6: Duplicate check
+    # Step 6: Duplicate check (DB + open exchange orders)
     can_continue, _, sr = step_duplicate_check(btc_hourly, db, market_slug)
     steps.append(sr)
     if not can_continue:
         output["action"] = "skipped"
         output["reason"] = sr.get("error", "Duplicate trade")
+        return output
+
+    # Step 6b: Exchange-level duplicate check — catch any open orders for this market
+    can_continue, _, sr = step_exchange_duplicate_check(pm_client, market_slug)
+    steps.append(sr)
+    if not can_continue:
+        output["action"] = "skipped"
+        output["reason"] = sr.get("error", "Duplicate open order")
         return output
 
     # Step 7: Size
@@ -588,6 +622,25 @@ def main():
     parser.add_argument("--loss-streak-limit", type=int, default=5, help="Consecutive losses before pause")
     args = parser.parse_args()
 
+    # Acquire exclusive file lock to prevent concurrent runs (duplicate trades).
+    # Lock file sits next to the DB so it shares the same persistent volume.
+    lock_path = Path(args.db).parent / "run_hourly.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(lock_path, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        result = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "dry_run": args.dry_run,
+            "steps": [],
+            "action": "skipped",
+            "reason": "Another run_hourly instance is already running (lock held)",
+        }
+        print(json.dumps(result, indent=2))
+        lock_fd.close()
+        sys.exit(0)
+
     try:
         result = run_hourly(args)
     except Exception as e:
@@ -598,6 +651,9 @@ def main():
             "action": "error",
             "reason": str(e),
         }
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
 
     print(json.dumps(result, indent=2))
 
