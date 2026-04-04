@@ -130,6 +130,63 @@ def alt_slug(slug: str) -> str:
     return ""
 
 
+def slug_to_fingerprint(slug: str) -> tuple[str, str, str] | None:
+    """Extract (month, day, time) from a market slug for fuzzy matching.
+
+    Handles both formats:
+      bitcoin-up-or-down-april-3-10pm-et        → (april, 3, 10pm)
+      bitcoin-up-or-down-april-3-2026-10pm-et   → (april, 3, 10pm)
+    """
+    m = re.match(
+        r"bitcoin-up-or-down-(\w+)-(\d+)(?:-\d{4})?-(\d{1,2}(?:am|pm))-et$",
+        slug, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).lower(), m.group(2), m.group(3).lower()
+    return None
+
+
+def match_trade_to_position(
+    trade: dict, positions: list[dict],
+) -> dict | None:
+    """Match a pending trade to a position by title when resolve fails.
+
+    Position titles look like:
+      "Bitcoin: Up or Down? - April 3, 10PM ET"
+      "Will the price of Bitcoin go up or down? April 3 10PM ET"
+    We extract month/day/time from the trade slug and match against the
+    title, plus compare outcome (Up/Down).
+    """
+    slug = trade.get("market_slug", "")
+    outcome = (trade.get("outcome_bought") or "").lower()
+    fp = slug_to_fingerprint(slug)
+    if not fp:
+        return None
+
+    month, day, time_str = fp  # e.g. ("april", "3", "10pm")
+
+    for pos in positions:
+        title = (pos.get("title") or "").lower()
+        pos_outcome = (pos.get("outcome") or "").lower()
+
+        # Must match outcome
+        if outcome and pos_outcome and outcome != pos_outcome:
+            continue
+
+        # Title must contain month, day, and time
+        if month not in title:
+            continue
+        # Day check: look for the number as a standalone token (avoid "13" matching "3")
+        if not re.search(rf"\b{day}\b", title):
+            continue
+        if time_str not in title:
+            continue
+
+        return pos
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main logic
 # ---------------------------------------------------------------------------
@@ -218,47 +275,41 @@ def run_redeem(args) -> dict:
             })
             continue
 
-        # Resolve market to get condition_id and end_date.
-        # Try stored slug first, fall back to alt format (year ↔ no-year).
-        resolve_result = run_cmd(
-            ["uv", "run", pm_client, "resolve", "--market-slug", market_slug],
-            f"resolve-{market_slug}",
-        )
+        # --- Strategy A: resolve slug → condition_id → match position ---
+        condition_id = ""
+        end_date: datetime | None = None
+        position: dict | None = None
+        match_method = ""
 
-        if not resolve_result.get("success") or not resolve_result.get("resolved"):
-            fallback = alt_slug(market_slug)
-            if fallback:
-                resolve_result = run_cmd(
-                    ["uv", "run", pm_client, "resolve", "--market-slug", fallback],
-                    f"resolve-{fallback}",
-                )
+        # Try stored slug, then alt format (year ↔ no-year)
+        for slug in [market_slug, alt_slug(market_slug)]:
+            if not slug:
+                continue
+            resolve_result = run_cmd(
+                ["uv", "run", pm_client, "resolve", "--market-slug", slug],
+                f"resolve-{slug}",
+            )
+            if resolve_result.get("success") and resolve_result.get("resolved"):
+                market_info = resolve_result.get("market", {})
+                condition_id = market_info.get("condition_id", "")
+                end_date = parse_timestamp(market_info.get("end_date", ""))
+                break
 
-        if not resolve_result.get("success") or not resolve_result.get("resolved"):
-            output["errors"].append({
-                "trade_id": trade_id,
-                "market_slug": market_slug,
-                "error": resolve_result.get("error", "Could not resolve market"),
-            })
-            continue
+        if condition_id:
+            position = position_by_condition.get(condition_id)
+            if position:
+                match_method = "resolve"
+                matched_condition_ids.add(condition_id)
 
-        market_info = resolve_result.get("market", {})
-        condition_id = market_info.get("condition_id", "")
-        end_date_str = market_info.get("end_date", "")
-        end_date = parse_timestamp(end_date_str)
+        # --- Strategy B: direct title matching against positions ---
+        if not position:
+            position = match_trade_to_position(trade, positions)
+            if position:
+                condition_id = position.get("condition_id", "")
+                match_method = "title_match"
+                matched_condition_ids.add(condition_id)
 
-        if not condition_id:
-            output["errors"].append({
-                "trade_id": trade_id,
-                "market_slug": market_slug,
-                "error": "No condition_id in resolved market",
-            })
-            continue
-
-        matched_condition_ids.add(condition_id)
-
-        # Find matching position
-        position = position_by_condition.get(condition_id)
-
+        # --- Evaluate position ---
         if position:
             current_price = position.get("current_price", 0.5)
             resolved = position.get("resolved", False)
@@ -266,7 +317,6 @@ def run_redeem(args) -> dict:
 
             # Determine outcome from current_price — don't require
             # resolved/redeemable flags since Polymarket can lag on these.
-            # Price at 0.99+ or 0.01- means the market has effectively settled.
             if current_price >= 0.99:
                 won = True
             elif current_price <= 0.01:
@@ -287,6 +337,7 @@ def run_redeem(args) -> dict:
                 "trade_id": trade_id,
                 "market_slug": market_slug,
                 "condition_id": condition_id,
+                "match_method": match_method,
                 "result": "won" if won else "lost",
                 "pnl": pnl,
                 "shares": shares,
@@ -328,39 +379,46 @@ def run_redeem(args) -> dict:
             output["resolutions"].append(resolution)
             output["resolved_count"] += 1
 
-        else:
-            # No position found — check if market has ended
-            if end_date and (now - end_date).total_seconds() > 7200:
-                # Market ended >2hrs ago with no position — likely unfilled or redeemed to 0
-                buy_price = trade.get("price", 0.50)
-                shares = trade.get("shares", 0)
-                pnl = round(-(shares * buy_price), 2)
+        elif condition_id and end_date and (now - end_date).total_seconds() > 7200:
+            # Resolved via API but no position — market ended >2hrs ago,
+            # likely unfilled or already redeemed to 0
+            buy_price = trade.get("price", 0.50)
+            shares = trade.get("shares", 0)
+            pnl = round(-(shares * buy_price), 2)
 
-                resolution = {
-                    "trade_id": trade_id,
-                    "market_slug": market_slug,
-                    "condition_id": condition_id,
-                    "result": "lost",
-                    "pnl": pnl,
-                    "reason": "No position found, market ended >2hrs ago",
-                }
+            resolution = {
+                "trade_id": trade_id,
+                "market_slug": market_slug,
+                "condition_id": condition_id,
+                "match_method": "no_position",
+                "result": "lost",
+                "pnl": pnl,
+                "reason": "No position found, market ended >2hrs ago",
+            }
 
-                if args.dry_run:
-                    resolution["db_update"] = {"dry_run": True}
-                else:
-                    update_result = run_cmd(
-                        ["uv", "run", btc_hourly, "update",
-                         "--db", db,
-                         "--trade-id", str(trade_id),
-                         "--lost",
-                         "--pnl", str(pnl),
-                         "--notes", "No position found after market end"],
-                        f"update-{trade_id}",
-                    )
-                    resolution["db_update"] = {"success": update_result.get("success", True)}
+            if args.dry_run:
+                resolution["db_update"] = {"dry_run": True}
+            else:
+                update_result = run_cmd(
+                    ["uv", "run", btc_hourly, "update",
+                     "--db", db,
+                     "--trade-id", str(trade_id),
+                     "--lost",
+                     "--pnl", str(pnl),
+                     "--notes", "No position found after market end"],
+                    f"update-{trade_id}",
+                )
+                resolution["db_update"] = {"success": update_result.get("success", True)}
 
-                output["resolutions"].append(resolution)
-                output["resolved_count"] += 1
+            output["resolutions"].append(resolution)
+            output["resolved_count"] += 1
+
+        elif not position and not condition_id:
+            output["errors"].append({
+                "trade_id": trade_id,
+                "market_slug": market_slug,
+                "error": "Could not resolve market or match to any position",
+            })
 
     # Step 4: Orphan detection
     for pos in positions:
