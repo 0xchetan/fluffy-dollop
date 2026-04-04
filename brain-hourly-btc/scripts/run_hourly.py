@@ -536,13 +536,12 @@ def run_hourly(args) -> dict:
     market_slug = market_data["market_slug"]
     up_price = market_data["up_price"]
 
-    # Determine outcome and buy price based on direction
+    # Determine outcome and buy price — fixed at 45¢ limit
+    buy_price = 0.45
     if direction == "up":
         outcome = "Up"
-        buy_price = up_price
     else:
         outcome = "Down"
-        buy_price = round(1.0 - up_price, 4)
 
     # Step 6: Duplicate check (DB + open exchange orders)
     can_continue, _, sr = step_duplicate_check(btc_hourly, db, market_slug)
