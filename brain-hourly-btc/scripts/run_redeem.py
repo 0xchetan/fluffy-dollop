@@ -345,10 +345,12 @@ def run_redeem(args) -> dict:
                 "redeemable": redeemable,
             }
 
-            # Attempt on-chain redeem only if Polymarket says it's redeemable
-            if won and redeemable:
+            # Attempt on-chain redeem for winners — don't trust the
+            # redeemable flag, just try it and let the contract decide.
+            # Polymarket lags on flipping redeemable for hourly markets.
+            if won and condition_id:
                 if args.dry_run:
-                    resolution["redeem"] = {"dry_run": True}
+                    resolution["redeem"] = {"dry_run": True, "redeemable_flag": redeemable}
                 else:
                     redeem_result = run_cmd(
                         ["uv", "run", pm_client, "redeem", "--condition-id", condition_id],
@@ -356,10 +358,10 @@ def run_redeem(args) -> dict:
                     )
                     resolution["redeem"] = {
                         "success": redeem_result.get("success", False),
+                        "attempted": True,
+                        "redeemable_flag": redeemable,
                         "error": redeem_result.get("error") if not redeem_result.get("success") else None,
                     }
-            elif won and not redeemable:
-                resolution["redeem"] = {"pending": True, "reason": "settled but not yet redeemable on-chain"}
 
             # Update DB regardless — accounting shouldn't wait for on-chain redemption
             if args.dry_run:
