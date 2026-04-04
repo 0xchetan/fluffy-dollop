@@ -422,7 +422,43 @@ def run_redeem(args) -> dict:
                 "error": "Could not resolve market or match to any position",
             })
 
-    # Step 4: Orphan detection
+    # Step 4: Sweep — try to redeem ALL winning positions regardless of DB.
+    # This catches positions where the DB was already updated (won) but
+    # the on-chain redeem failed or was never attempted.
+    output["sweep"] = []
+    for pos in positions:
+        cid = pos.get("condition_id", "")
+        current_price = pos.get("current_price", 0.5)
+        title = (pos.get("title") or "")
+
+        if not cid:
+            continue
+
+        if current_price >= 0.99:
+            sweep_entry: dict = {
+                "condition_id": cid,
+                "title": title,
+                "outcome": pos.get("outcome"),
+                "size": pos.get("size"),
+                "current_price": current_price,
+            }
+
+            if args.dry_run:
+                sweep_entry["redeem"] = {"dry_run": True}
+            else:
+                redeem_result = run_cmd(
+                    ["uv", "run", pm_client, "redeem", "--condition-id", cid],
+                    f"sweep-redeem-{cid[:12]}",
+                )
+                sweep_entry["redeem"] = {
+                    "success": redeem_result.get("success", False),
+                    "error": redeem_result.get("error") if not redeem_result.get("success") else None,
+                }
+
+            output["sweep"].append(sweep_entry)
+
+    # Step 5: Orphan detection — positions not matched to any DB trade
+    output["orphans"] = []
     for pos in positions:
         title = (pos.get("title") or "").lower()
         cid = pos.get("condition_id", "")
