@@ -24,6 +24,11 @@ Commands:
     update   — Mark a trade won/lost (during redeem cycle)
     status   — Rolling stats: win rate, P&L, streak, sample size
     history  — Full trade history as JSON
+    regimes  — Per-commit-hash trade breakdown
+
+The rolling stats and Kelly sizing are scoped to the *current* strategy git
+commit so that strategy changes (e.g. price tweaks, new logic) start a fresh
+window instead of mixing old/new regimes. Pass --all-regimes to override.
 
 Usage:
     uv run btc_hourly.py predict
@@ -32,6 +37,7 @@ Usage:
     uv run btc_hourly.py update --db trades.db --trade-id 1 --won --pnl 12.50
     uv run btc_hourly.py status --db trades.db
     uv run btc_hourly.py history --db trades.db
+    uv run btc_hourly.py regimes --db trades.db
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ import argparse
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,9 +59,49 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).parent))
 
 from kelly import adjusted_kelly, auto_kelly_multiplier, kelly_fraction, rolling_win_rate
-from trade_log import get_history, get_rolling_results, get_stats, init_db, record_prediction, resolve_trade
+from trade_log import (
+    get_history,
+    get_regimes,
+    get_rolling_results,
+    get_stats,
+    init_db,
+    record_prediction,
+    resolve_trade,
+)
 
 ET = ZoneInfo("America/New_York")
+
+# Strategy files — only commits that touch these files create a new regime.
+# Doc-only or playbook.yaml edits do not reset the rolling window.
+STRATEGY_FILES = [
+    "scripts/run_hourly.py",
+    "scripts/btc_hourly.py",
+    "scripts/kelly.py",
+    "scripts/trade_log.py",
+]
+
+
+def get_strategy_commit() -> str | None:
+    """Return the git commit hash of the most recent change to strategy files.
+
+    Each daemon container clones the playbook repo at boot, so this resolves
+    to the commit currently checked out in that container. Returns None if
+    git is unavailable or we're not inside a repo (e.g. dev/test runs).
+    """
+    repo_root = Path(__file__).resolve().parent.parent  # playbook root
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "log", "-1", "--format=%H", "--", *STRATEGY_FILES],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 # ---------------------------------------------------------------------------
@@ -220,9 +267,15 @@ async def cmd_predict(args):
 
 
 async def cmd_size(args):
-    """Calculate bet amount — uses trading balance as bankroll, Kelly auto-escalates."""
+    """Calculate bet amount — uses trading balance as bankroll, Kelly auto-escalates.
+
+    The rolling window is scoped to the current strategy commit (regime). After a
+    strategy change, the new commit starts a fresh window so we cold-start instead
+    of mixing pre/post-change win rates.
+    """
+    commit_hash = None if args.all_regimes else get_strategy_commit()
     conn = init_db(args.db)
-    results = get_rolling_results(conn, args.window)
+    results = get_rolling_results(conn, args.window, commit_hash=commit_hash)
     conn.close()
 
     win_rate, sample_size = rolling_win_rate(results, args.window)
@@ -248,7 +301,8 @@ async def cmd_size(args):
             "window": args.window,
             "balance": balance,
             "bet_amount": bet,
-            "reason": f"Only {sample_size}/{args.window} resolved trades — flat bet",
+            "commit_hash": commit_hash,
+            "reason": f"Only {sample_size}/{args.window} resolved trades on this regime — flat bet",
         }, indent=2))
         return
 
@@ -259,6 +313,7 @@ async def cmd_size(args):
             "win_rate": round(win_rate, 4),
             "balance": balance,
             "bet_amount": 0,
+            "commit_hash": commit_hash,
             "reason": f"Win rate {win_rate:.1%} <= 50% over {sample_size} trades — no edge",
         }, indent=2))
         return
@@ -279,11 +334,17 @@ async def cmd_size(args):
         "balance": balance,
         "max_bet": args.max_bet,
         "bet_amount": round(bet, 2),
+        "commit_hash": commit_hash,
     }, indent=2))
 
 
 async def cmd_record(args):
-    """Record a trade to the database after placing an order."""
+    """Record a trade to the database after placing an order.
+
+    Tags the trade with the current strategy git commit so that the rolling
+    win-rate window can be scoped per-regime.
+    """
+    commit_hash = get_strategy_commit()
     conn = init_db(args.db)
     trade_id = record_prediction(
         conn,
@@ -297,9 +358,10 @@ async def cmd_record(args):
         price=args.price,
         order_id=args.order_id,
         status="pending",
+        commit_hash=commit_hash,
     )
     conn.close()
-    print(json.dumps({"trade_id": trade_id, "status": "recorded"}))
+    print(json.dumps({"trade_id": trade_id, "status": "recorded", "commit_hash": commit_hash}))
 
 
 async def cmd_update(args):
@@ -319,9 +381,10 @@ async def cmd_update(args):
 
 
 async def cmd_status(args):
-    """Show rolling stats."""
+    """Show rolling stats. Rolling window is scoped to the current strategy commit."""
+    commit_hash = None if args.all_regimes else get_strategy_commit()
     conn = init_db(args.db)
-    stats = get_stats(conn, args.window)
+    stats = get_stats(conn, args.window, commit_hash=commit_hash)
     conn.close()
     print(json.dumps(stats, indent=2))
 
@@ -332,6 +395,17 @@ async def cmd_history(args):
     history = get_history(conn, args.limit)
     conn.close()
     print(json.dumps(history, indent=2, default=str))
+
+
+async def cmd_regimes(args):
+    """Show per-commit-hash trade breakdown."""
+    conn = init_db(args.db)
+    regimes = get_regimes(conn)
+    conn.close()
+    print(json.dumps({
+        "current_commit": get_strategy_commit(),
+        "regimes": regimes,
+    }, indent=2, default=str))
 
 
 def main():
@@ -346,6 +420,7 @@ def main():
     p.add_argument("--max-bet", type=float, required=True, help="Maximum bet per trade in USD")
     p.add_argument("--buy-price", type=float, default=0.50, help="Market buy price (default: 0.50)")
     p.add_argument("--window", type=int, default=50, help="Rolling window size")
+    p.add_argument("--all-regimes", action="store_true", help="Use all trades, not just current strategy commit")
 
     p = sub.add_parser("record", help="Record a trade after placing an order")
     p.add_argument("--db", default="trades.db", help="Path to trade database")
@@ -371,10 +446,14 @@ def main():
     p = sub.add_parser("status", help="Show rolling stats")
     p.add_argument("--db", default="trades.db", help="Path to trade database")
     p.add_argument("--window", type=int, default=50, help="Rolling window size")
+    p.add_argument("--all-regimes", action="store_true", help="Use all trades, not just current strategy commit")
 
     p = sub.add_parser("history", help="Show trade history")
     p.add_argument("--db", default="trades.db", help="Path to trade database")
     p.add_argument("--limit", type=int, default=50, help="Number of trades to show")
+
+    p = sub.add_parser("regimes", help="Per-commit-hash trade breakdown")
+    p.add_argument("--db", default="trades.db", help="Path to trade database")
 
     args = parser.parse_args()
 
@@ -391,6 +470,7 @@ def main():
         "update": cmd_update,
         "status": cmd_status,
         "history": cmd_history,
+        "regimes": cmd_regimes,
     }[args.command]
 
     try:

@@ -160,15 +160,17 @@ def step_risk_check(btc_hourly: str, db: str, window: int, loss_streak_limit: in
         return True, result, step_result("risk_check", True, {"status": "cold_start", "resolved": 0})
 
     resolved = result.get("resolved", 0)
+    rolling_sample = result.get("rolling_sample_size", 0)
     win_rate = result.get("rolling_win_rate")
     streak = result.get("current_streak", 0)
     streak_type = result.get("current_streak_type")
 
-    # Check negative edge with sufficient sample
-    if win_rate is not None and win_rate <= 0.50 and resolved >= window:
+    # Check negative edge with sufficient sample (regime-scoped: only pause once
+    # the *current strategy commit* has accumulated a full window of resolved trades).
+    if win_rate is not None and win_rate <= 0.50 and rolling_sample >= window:
         return False, result, step_result(
             "risk_check", False,
-            error=f"Win rate {win_rate:.1%} <= 50% over {resolved} resolved trades — paused",
+            error=f"Win rate {win_rate:.1%} <= 50% over {rolling_sample} resolved trades on this regime — paused",
         )
 
     # Check consecutive loss streak
@@ -180,6 +182,7 @@ def step_risk_check(btc_hourly: str, db: str, window: int, loss_streak_limit: in
 
     return True, result, step_result("risk_check", True, {
         "resolved": resolved,
+        "rolling_sample_size": rolling_sample,
         "rolling_win_rate": win_rate,
         "streak": streak,
         "streak_type": streak_type,
